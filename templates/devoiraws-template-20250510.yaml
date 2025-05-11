@@ -1,0 +1,299 @@
+AWSTemplateFormatVersion: '2010-09-09'  # Version standard obligatoire pour tout template CloudFormation
+
+Description: >
+  This CloudFormation template creates:
+  - a DynamoDB table
+  - a Lambda function (trigger optional from S3 upload)
+  - a security group for EC2
+  - an EC2 instance with two EBS volumes
+  - a startup script for the EC2 instance
+  - a Python script to scan the DynamoDB table
+  - a notification configuration for S3 to trigger the Lambda function
+  - a Lambda permission to allow S3 to invoke the Lambda function
+
+# -------------------
+# PARAMÈTRES D’ENTRÉE
+# -------------------
+Parameters:
+  EnvName:
+    Type: String
+    Default: "dev"
+    Description: PROD, DEV, UAT, etc.
+  BucketName:
+    Type: String
+    Default: "s3-bucket"
+    Description: Base du nom du bucket S3
+  VpcId:
+    Type: String
+    Default: "vpc-0b5f3f9b482b7b7a4"
+    Description: ID du VPC utilisé
+
+# --------------------
+# RESSOURCES PRINCIPALES
+# --------------------
+Resources:
+
+  # 1. Bucket S3 qui déclenche la Lambda lors d’un upload
+  DefaultS3Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${BucketName}-file-metadata-brillantdawoussou-bucket"
+      # NotificationConfiguration:
+      #   LambdaConfigurations:
+      #     - Event: "s3:ObjectCreated:*"
+      #     - Function: arn:aws:lambda:eu-west-3:629193321657:function:lambda-function-brillantdawoussou
+
+  # 2. Table DynamoDB pour stocker les métadonnées des fichiers uploadés
+  DynamoDBTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "FileMetadata-${EnvName}"
+      AttributeDefinitions:
+        - AttributeName: "FileName"
+          AttributeType: "S"
+      KeySchema:
+        - AttributeName: "FileName"
+          KeyType: "HASH"
+      ProvisionedThroughput:
+        ReadCapacityUnits: 5
+        WriteCapacityUnits: 5
+
+  # 3. Groupe de sécurité pour EC2 avec accès SSH, HTTP, HTTPS
+  MySecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub "${EnvName}-security-group"
+      GroupDescription: "Securite pour EC2"
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0  # SSH depuis ton IP publique
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0          # HTTP public
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0          # HTTPS public
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvName}-SecurityGroup"
+
+  # 4. Fonction Lambda déclenchée à chaque ajout d’objet S3
+  LambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "lambda-function-${EnvName}"
+      Role: "arn:aws:iam::629193321657:role/lambda-devoir-execution-role"  # Rôle existant avec droits Lambda + DynamoDB
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Timeout: 30
+      MemorySize: 128
+      Environment:
+        Variables:
+          DYNAMODB_TABLE: !Ref DynamoDBTable
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+
+          def lambda_handler(event, context):
+              dynamodb = boto3.resource('dynamodb')
+              table = dynamodb.Table(os.environ['DYNAMODB_TABLE'])
+
+              for record in event['Records']:
+                  bucket = record['s3']['bucket']['name']
+                  key = record['s3']['object']['key']
+                  table.put_item(Item={
+                      'FileName': key,
+                      'BucketName': bucket
+                  })
+
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps('Lambda processing complete')
+              }
+
+  # 5. Autorisation pour que S3 puisse invoquer la Lambda
+  S3LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt LambdaFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceArn: !GetAtt DefaultS3Bucket.Arn  # Seul ce bucket peut invoquer la fonction
+  
+  # 6. Configuration de déclenchement Lambda depuis S3 (quand un objet est créé)
+  s3LambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Sub "lambda-function-${EnvName}"
+      Principal: s3.amazonaws.com
+      SourceArn: !GetAtt DefaultS3Bucket.Arn
+
+  # 7. Instance EC2 avec 2 disques EBS, script de démarrage, et accès SSH/HTTP
+  EC2Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: t2.micro
+      ImageId: ami-0160e8d70ebc43ee1
+      KeyName: "iabdkey"
+      SubnetId: subnet-0a230d78bf307974b
+      SecurityGroupIds:
+        - !Ref MySecurityGroup
+      BlockDeviceMappings:
+        - DeviceName: "/dev/sdm"
+          Ebs:
+            VolumeType: "io1"
+            Iops: "200"
+            DeleteOnTermination: true
+            VolumeSize: 20
+        - DeviceName: "/dev/xvdm"  # Deuxième volume attaché
+          Ebs:
+            VolumeType: "gp2"
+            VolumeSize: 10
+            DeleteOnTermination: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvName}-EC2Instance"
+        - Key: Class
+          Value: !Sub "${EnvName}-brillantdawoussou"
+        - Key: Environment
+          Value: !Ref EnvName
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          exec > >(tee /var/log/userdata.log | logger -t userdata -s 2>/dev/console) 2>&1
+          set -e
+
+          echo "[1] Installation"
+          apt-get update -y
+          apt-get install -y python3-pip python3-venv unzip
+
+          echo "[2] Création d'un virtualenv"
+          python3 -m venv /opt/scanenv
+          source /opt/scanenv/bin/activate
+          /opt/scanenv/bin/pip install boto3
+
+          echo "[3] Variable d'environnement"
+          export ENV_NAME=${EnvName}
+          echo "export ENV_NAME=${EnvName}" >> /home/ubuntu/.bashrc
+
+          # Attente de la disponibilité du disque EBS
+          for i in {1..12}; do [ -b /dev/xvdm ] && break; sleep 5; done
+
+          #------------------------------------------------------------------------------------
+          # Configuration de LVM
+          #!/bin/bash
+          exec > >(tee /var/log/userdata.log | logger -t userdata -s 2>/dev/console) 2>&1
+          set -e
+
+          echo "[4] Installation"
+          apt-get update -y
+          apt-get install -y python3-pip python3-venv unzip lvm2
+
+          echo "[5] Création d'un virtualenv"
+          python3 -m venv /opt/scanenv
+          source /opt/scanenv/bin/activate
+          /opt/scanenv/bin/pip install boto3
+
+          echo "[6] Variable d'environnement"
+          export ENV_NAME=${EnvName}
+          echo "export ENV_NAME=${EnvName}" >> /home/ubuntu/.bashrc
+
+          echo "[7] Attente de /dev/xvdm"
+          for i in {1..12}; do [ -b /dev/xvdm ] && break; sleep 5; done
+
+          # LVM Setup
+          DISK="/dev/xvdm"
+          if [ ! -b "$DISK" ]; then
+            echo "Erreur : $DISK non trouvé"
+            exit 1
+          fi
+
+          echo "[8] Création VG et LVM"
+          sudo pvcreate $DISK
+          sudo vgcreate datavg $DISK
+          sudo lvcreate -n lv_backups -L 5G datavg
+          sudo lvcreate -n lv_log_dynamodb -L 2G datavg
+
+          echo "[9] Formatage"
+          sudo mkfs.ext4 /dev/datavg/lv_backups
+          sudo mkfs.ext4 /dev/datavg/lv_log_dynamodb
+
+          echo "[10] Montage des volumes"
+          sudo mkdir -p /backups /var/log/dynamodb
+          sudo mount /dev/datavg/lv_backups /backups
+          sudo mount /dev/datavg/lv_log_dynamodb /var/log/dynamodb
+
+          echo "[11] Droits et permissions"
+          sudo chown -R ubuntu:ubuntu /backups
+          sudo chown -R ubuntu:ubuntu /var/log/dynamodb
+          sudo chmod -R 755 /backups
+          sudo chmod -R 755 /var/log/dynamodb
+
+          echo "[12] Configuration du montage automatique"
+          echo '/dev/datavg/lv_backups /backups ext4 defaults 0 2' | sudo tee -a /etc/fstab
+          echo '/dev/datavg/lv_log_dynamodb /var/log/dynamodb ext4 defaults 0 2' | sudo tee -a /etc/fstab
+
+          echo "[13] Vérifications"
+          df -h | grep -E "/backups|/var/log/dynamodb"
+
+          echo "Tous les volumes sont prêts."
+
+          #--------------------------------------------------------------------------------------------------
+
+          sudo mkdir -p /home/ubuntu/scripts/
+          sudo chown -R ubuntu:ubuntu /home/ubuntu/scripts/
+          sudo chmod -R 755 /home/ubuntu/scripts/
+
+          echo "[14] Création du script Python"
+          # Écriture du script Python
+          cat > /home/ubuntu/scripts/scan_dynamodb.py << EOF
+          import boto3
+          import logging
+          import os
+
+          logging.basicConfig(filename="/var/log/dynamodb/dynamodb_scan.log", level=logging.INFO)
+
+          def scan_table():
+            session = boto3.Session(
+                aws_access_key_id='AKIAZE7WYFS4ZGXIDANE',
+                aws_secret_access_key='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',
+                region_name='eu-west-3'
+            )
+            dynamodb = session.resource('dynamodb')
+            table = dynamodb.Table("FileMetadata-${EnvName}")
+            response = table.scan()
+            for item in response.get("Items", []):
+                logging.info(f"FileName: {item.get('FileName')} | Bucket: {item.get('BucketName')}")
+
+          if __name__ == "__main__":
+              scan_table()
+          EOF
+
+          sudo chmod +x /home/ubuntu/scripts/scan_dynamodb.py
+
+          echo "[15] Exécution initiale"
+          sudo /opt/scanenv/bin/python /home/ubuntu/scripts/scan_dynamodb.py
+
+          echo "[DONE] Terminé"
+
+# ------------------
+# SORTIES UTILES
+# ------------------
+Outputs:
+  BucketName:
+    Value: !Ref DefaultS3Bucket
+    Description: "Nom du bucket S3 créé"
+  LambdaName:
+    Value: !Ref LambdaFunction
+    Description: "Nom de la fonction Lambda"
+  InstanceId:
+    Value: !Ref EC2Instance
+    Description: "ID de l'instance EC2"
