@@ -1,7 +1,3 @@
-## NOM : DAWOUSSOU
-
-PRENOMS : KODZO SEWONU BRILLANT
-
 # Projet AWS CloudFormation - Déploiement d'une Infrastructure Complète
 
 ## 1- Description
