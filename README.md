@@ -240,6 +240,6 @@ Une fois connecter lancer la commande utile  : "**Vérifier le fichier de log d'
 
 ## Auteur
 
-**DAWOUSSOU KODZO SEWONU BRILLANT**
+**DAWOUSSOU BRILLANT**
 
 CloudFormation - Infrastructure AWS
